@@ -1,11 +1,12 @@
 use reaper_high::Guid;
 use reaper_high::Reaper;
 use reaper_high::Track;
+use reaper_high::Volume;
 use reaper_macros::reaper_extension_plugin;
+use reaper_medium::MasterTrackBehavior;
 use reaper_medium::{CommandId, ControlSurface, HookCommand};
 use rubrail::BarId;
 use rubrail::ItemId;
-use std::collections::HashSet;
 use std::error::Error;
 
 use rubrail::TTouchbar;
@@ -29,6 +30,9 @@ fn plugin_main() -> Result<(), Box<dyn Error>> {
     let mut tb = Touchbar::alloc("Reaper");
     let bar_id = tb.create_bar();
 
+    let label_id = tb.create_label("meow");
+
+    // normal items
     let bpm_id = tb.create_button(
         None,
         Some("Log bpm"),
@@ -38,12 +42,19 @@ fn plugin_main() -> Result<(), Box<dyn Error>> {
             r.show_console_msg(format!("your bpm is set to {bpm}\n"));
         }),
     );
-    let label_id = tb.create_label("meow");
+
+    // track items
     let mute_button = tb.create_button(None, Some("Mute"), Box::new(mute_selected));
     let solo_button = tb.create_button(None, Some("Solo"), Box::new(solo_selected));
+    let volume_slider = tb.create_slider(0.0, 1.0, Some("Volume"), true, Box::new(volume_selected));
 
-    tb.add_items_to_bar(&bar_id, vec![label_id, bpm_id]);
+    tb.add_items_to_bar(&bar_id, vec![label_id]);
     tb.set_bar_as_root(bar_id);
+
+    let project = Reaper::get().current_project();
+    let last_selected_track = project
+        .first_selected_track(reaper_medium::MasterTrackBehavior::ExcludeMasterTrack)
+        .map(|t| *t.guid());
 
     unsafe {
         STATE = Some(State {
@@ -51,11 +62,12 @@ fn plugin_main() -> Result<(), Box<dyn Error>> {
             tb: Box::leak(tb),
             label_id,
             bar_id,
+            track_volume_id: volume_slider,
 
             normal_tb_elements: vec![label_id, bpm_id],
-            track_tb_elements: vec![label_id, mute_button, solo_button],
+            track_tb_elements: vec![label_id, mute_button, solo_button, volume_slider],
 
-            selected_tracks: HashSet::new(),
+            last_selected_track,
             mode: Mode::Normal,
         });
     }
@@ -68,10 +80,12 @@ struct State {
     label_id: ItemId,
     bar_id: BarId,
 
+    track_volume_id: ItemId,
+
     normal_tb_elements: Vec<ItemId>,
     track_tb_elements: Vec<ItemId>,
 
-    selected_tracks: HashSet<Guid>,
+    last_selected_track: Option<Guid>,
     mode: Mode,
 }
 
@@ -113,9 +127,10 @@ struct MyHookCommand;
 
 impl HookCommand for MyHookCommand {
     fn call(_command_id: CommandId, _flag: i32) -> bool {
+        // NOTE this gets run every time an action is run
+
         // let r = Reaper::get().medium_reaper();
         // r.show_console_msg(format!("Executing command {command_id}!\n"));
-
         // update_label(&format!("Last command: {command_id}"));
 
         false
@@ -132,31 +147,96 @@ impl ControlSurface for MyControlSurface {
                 return;
             };
 
-            let track = Track::new(args.track, None);
-            let id = track.guid();
+            let project = Reaper::get().current_project();
 
-            if args.is_selected {
-                state.selected_tracks.insert(*id);
-            } else {
-                state.selected_tracks.remove(id);
-            }
-
-            if state.selected_tracks.is_empty() {
+            let selected_count =
+                project.selected_track_count(MasterTrackBehavior::ExcludeMasterTrack);
+            if selected_count == 0 {
                 state.change_mode(Mode::Normal);
                 update_label("No tracks selected")
             } else {
                 state.change_mode(Mode::Track);
-                update_label(&format!("{} tracks selected", state.selected_tracks.len()))
+                update_label(&format!("{} tracks selected", selected_count))
+            }
+
+            let track = Track::new(args.track, None);
+            let id = track.guid();
+            if args.is_selected {
+                state.tb.update_slider(
+                    &state.track_volume_id,
+                    track.volume().soft_normalized_value(),
+                );
+                state.last_selected_track = Some(*id);
             }
         }
     }
 
-    // fn set_surface_volume(&self, args: reaper_medium::SetSurfaceVolumeArgs) {
-    //     update_label(&format!("Track volume: {}", args.volume.get()));
-    // }
+    fn set_surface_volume(&self, args: reaper_medium::SetSurfaceVolumeArgs) {
+        unsafe {
+            let Some(state) = &mut STATE else {
+                return;
+            };
+
+            let track = Track::new(args.track, None);
+
+            // only update the slider if the last selected track is the one changing volume
+            if Some(*track.guid()) != state.last_selected_track {
+                return;
+            }
+
+            state.tb.update_slider(
+                &state.track_volume_id,
+                track.volume().soft_normalized_value(),
+            );
+        }
+    }
 }
 
-fn mute_selected(_: &u64) {
+fn mute_selected(_: &ItemId) {
+    let reaper = Reaper::get();
+    let project = reaper.current_project();
+
+    let Some(track) =
+            project.first_selected_track(reaper_medium::MasterTrackBehavior::ExcludeMasterTrack)
+        else {
+            return;
+        };
+
+    if track.is_muted() {
+        track.unmute(
+            reaper_medium::GangBehavior::AllowGang,
+            reaper_high::GroupingBehavior::UseGrouping,
+        );
+    } else {
+        track.mute(
+            reaper_medium::GangBehavior::AllowGang,
+            reaper_high::GroupingBehavior::UseGrouping,
+        );
+    }
+}
+fn solo_selected(_: &ItemId) {
+    let reaper = Reaper::get();
+    let project = reaper.current_project();
+
+    let Some(track) =
+            project.first_selected_track(reaper_medium::MasterTrackBehavior::ExcludeMasterTrack)
+        else {
+            return;
+        };
+
+    if track.is_solo() {
+        track.unsolo(
+            reaper_medium::GangBehavior::AllowGang,
+            reaper_high::GroupingBehavior::UseGrouping,
+        );
+    } else {
+        track.solo(
+            reaper_medium::GangBehavior::AllowGang,
+            reaper_high::GroupingBehavior::UseGrouping,
+        );
+    }
+}
+fn volume_selected(_: &ItemId, v: f64) {
     unsafe {
         let Some(state) = &mut STATE else {
             return;
@@ -165,46 +245,17 @@ fn mute_selected(_: &u64) {
         let reaper = Reaper::get();
         let project = reaper.current_project();
 
-        for track_guid in &state.selected_tracks {
-            if let Ok(track) = project.track_by_guid(track_guid) {
-                if track.is_muted() {
-                    track.unmute(
-                        reaper_medium::GangBehavior::AllowGang,
-                        reaper_high::GroupingBehavior::UseGrouping,
-                    );
-                } else {
-                    track.mute(
-                        reaper_medium::GangBehavior::AllowGang,
-                        reaper_high::GroupingBehavior::UseGrouping,
-                    );
-                }
-            }
-        }
-    }
-}
-fn solo_selected(_: &u64) {
-    unsafe {
-        let Some(state) = &mut STATE else {
+        let Some(track) =
+            state.last_selected_track.and_then(|t| project.track_by_guid(&t).ok())
+        else {
             return;
         };
 
-        let reaper = Reaper::get();
-        let project = reaper.current_project();
-
-        for track_guid in &state.selected_tracks {
-            if let Ok(track) = project.track_by_guid(track_guid) {
-                if track.is_solo() {
-                    track.unsolo(
-                        reaper_medium::GangBehavior::AllowGang,
-                        reaper_high::GroupingBehavior::UseGrouping,
-                    );
-                } else {
-                    track.solo(
-                        reaper_medium::GangBehavior::AllowGang,
-                        reaper_high::GroupingBehavior::UseGrouping,
-                    );
-                }
-            }
-        }
+        let vol = Volume::try_from_soft_normalized_value(v.min(4.0)).unwrap_or(Volume::MIN);
+        track.set_volume(
+            vol,
+            reaper_medium::GangBehavior::AllowGang,
+            reaper_high::GroupingBehavior::UseGrouping,
+        );
     }
 }
