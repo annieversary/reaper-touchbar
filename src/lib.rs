@@ -3,6 +3,7 @@ use reaper_high::Reaper;
 use reaper_high::Track;
 use reaper_high::Volume;
 use reaper_macros::reaper_extension_plugin;
+use reaper_medium::Db;
 use reaper_medium::MasterTrackBehavior;
 use reaper_medium::{CommandId, ControlSurface, HookCommand};
 use rubrail::BarId;
@@ -177,12 +178,18 @@ impl ControlSurface for MyControlSurface {
                 return;
             };
 
-            let track = Track::new(args.track, None);
+            let reaper = Reaper::get().medium_reaper();
 
-            // only update the slider if the last selected track is the one changing volume
-            if Some(*track.guid()) != state.last_selected_track {
+            if reaper
+                .get_media_track_info_value(args.track, reaper_medium::TrackAttributeKey::Selected)
+                as u64
+                == 0
+            {
                 return;
             }
+
+            let track = Track::new(args.track, None);
+            state.last_selected_track = Some(*track.guid());
 
             state.tb.update_slider(
                 &state.track_volume_id,
